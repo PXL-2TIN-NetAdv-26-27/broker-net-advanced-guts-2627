@@ -72,20 +72,29 @@ permissions:
   contents: read
   issues: write
 
-concurrency:
-  # Serialised per accepting account, and keyed on the same field the signature
-  # and the dispatch use. `github.actor` is a third reading of the same fact.
-  group: accept-${{ github.event.issue.user.login }}
-  cancel-in-progress: false
+# NO CONCURRENCY GROUP. One per accepting account used to live here. GitHub
+# keeps ONE pending run per group and cancels it for the next arrival, and a run
+# that never gets a runner holds the group for up to a day - so a student whose
+# first attempt was stuck could not get a second one past this point. Nothing
+# here needs serialising: every step acts on its own issue, and the hub orders a
+# student's attempts by issue number (lib/acceptance-reservation.mjs).
 
 jobs:
   dispatch:
     # Evaluated BEFORE a runner is allocated. An issue that is not an acceptance
     # attempt, or an assignment whose invitations are switched off, is skipped
     # without consuming a runner at all.
+    # `pxl-confirm:` is the SAME link asking a smaller question: bind this
+    # account to an institutional address, and nothing else - no repository, no
+    # roster gate, no deadline. It rides this broker on purpose, so it inherits
+    # the kill switch on the line below and the nonce rotation that retires
+    # every link at once, instead of having a lifetime of its own that nobody
+    # would remember to end. The purpose is inside the signature, not just this
+    # prefix - see lib/acceptance-signature.mjs.
     if: >-
       github.event.action == 'opened'
-      && startsWith(github.event.issue.title, 'pxl-accept:')
+      && (startsWith(github.event.issue.title, 'pxl-accept:')
+          || startsWith(github.event.issue.title, 'pxl-confirm:'))
       && vars.INVITE_ENABLED != 'false'
     runs-on: ubuntu-latest
     steps:
@@ -150,7 +159,7 @@ jobs:
       # verifier - lib/invite-token.mjs is Node-builtin-only precisely so that
       # no `npm ci` is needed on a credential-bearing public repository.
       - name: Check out the hub
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: PXL-Digital-Application-Samples/pxl-classroom
           ref: main
@@ -181,25 +190,27 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          # No checkout of this repo, so gh has no remote to infer it from.
-          GH_REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
           REASON: ${{ steps.verify.outputs.reason }}
+          # lib/github-api-version.mjs, which YAML cannot import; the test
+          # tests/github-api-version.test.mjs holds this equal to it.
+          GITHUB_API_VERSION: "2026-03-10"
         run: |
           echo "::notice::Invitation rejected (${REASON}) - no credential was used"
           [ -n "$ISSUE_NUMBER" ] || exit 0
+          ISSUE="repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}"
           # Redact first. A rejection is usually a forged or retired token, but
           # `wrong-assignment` means a LIVE token for a different assignment was
           # posted here - and this repository is public. Renaming costs no
           # credential, so the §4.3.2 floor (a bad token reaches nothing
           # privileged) still holds.
-          gh issue edit "$ISSUE_NUMBER" --title "Acceptance attempt (rejected)" || true
+          gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method PATCH "$ISSUE" -f title="Acceptance attempt (rejected)" >/dev/null || true
           # Deliberately generic: the precise reason stays in this run's log
           # rather than becoming a probing oracle on a public repository.
-          gh issue comment "$ISSUE_NUMBER" --body \
-            "This invitation link is not valid for this assignment, or is no longer current. Ask your lecturer for an up-to-date link." || true
-          gh issue close "$ISSUE_NUMBER" --reason "not planned" || true
-          gh issue lock "$ISSUE_NUMBER" --reason "resolved" || true
+          gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method POST "$ISSUE/comments" \
+            -f body="This invitation link is not valid for this assignment, or is no longer current. Ask your lecturer for an up-to-date link." >/dev/null || true
+          gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method PATCH "$ISSUE" -f state=closed -f state_reason=not_planned >/dev/null || true
+          gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method PUT "$ISSUE/lock" -f lock_reason=resolved >/dev/null || true
 
       - name: Mint dispatcher token
         if: steps.verify.outputs.valid == 'true'
@@ -215,6 +226,7 @@ jobs:
           permission-contents: write
 
       - name: Dispatch to central pxl-classroom
+        id: dispatch
         if: steps.verify.outputs.valid == 'true'
         shell: bash
         env:
@@ -226,7 +238,15 @@ jobs:
           ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
           TEAM_HINT: ${{ steps.parse.outputs.team_hint }}
           BROKER_REPO: ${{ github.repository }}
+          # From the VERIFIER, which checked a signature covering it - never
+          # re-read off the title here. Empty from an older verifier, and the
+          # hub reads an absent kind as `accept`, which is what every dispatch
+          # before this change meant.
+          KIND: ${{ steps.verify.outputs.kind }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # lib/github-api-version.mjs, which YAML cannot import; the test
+          # tests/github-api-version.test.mjs holds this equal to it.
+          GITHUB_API_VERSION: "2026-03-10"
         run: |
           ARGS=(
             "/repos/PXL-Digital-Application-Samples/pxl-classroom/dispatches"
@@ -244,7 +264,26 @@ jobs:
           if [ -n "$TEAM_HINT" ]; then
             ARGS+=(-f "client_payload[team_hint]=$TEAM_HINT")
           fi
-          gh api --method POST "${ARGS[@]}"
+          if [ -n "$KIND" ]; then
+            ARGS+=(-f "client_payload[kind]=$KIND")
+          fi
+          # RETRIED, because a GitHub error here is the whole attempt lost: the
+          # issue would be retitled and the student's page would wait for an
+          # answer that is not coming. Five tries over about a minute and a
+          # quarter rides out a short incident; past that the next step titles
+          # the issue "(not delivered)" so the page can say so at once.
+          # Delivering twice is harmless - the hub decides a student's attempt
+          # idempotently.
+          for WAIT in 5 10 20 40 0; do
+            if gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method POST "${ARGS[@]}"; then
+              exit 0
+            fi
+            [ "$WAIT" -gt 0 ] || break
+            echo "Dispatch failed; trying again in ${WAIT}s."
+            sleep "$WAIT"
+          done
+          echo "::error::Could not hand this acceptance to the hub."
+          exit 1
 
       # The trigger issue's TITLE carries the assignment's signed invitation, and
       # this repository is public. Closing and locking hide nothing - a locked,
@@ -261,17 +300,54 @@ jobs:
       # group payload out of the body. Deleting here would race that read and
       # break every group acceptance.
       #
-      # `gh issue edit --title` needs only `issues: write`, so this costs no
+      # Renaming an issue needs only `issues: write`, so this costs no
       # extra credential on a repository that already holds too many.
-      - name: Redact and close trigger issue
+      - name: Redact and lock trigger issue
         if: always() && steps.verify.outputs.valid == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
+          # Only to name what happened. The redaction itself does not depend on
+          # it, so an empty kind still rewrites the title.
+          KIND: ${{ steps.verify.outputs.kind }}
+          # `success`, `failure` or `skipped` (the token could not be minted).
+          DELIVERED: ${{ steps.dispatch.outcome }}
+          # lib/github-api-version.mjs, which YAML cannot import; the test
+          # tests/github-api-version.test.mjs holds this equal to it.
+          GITHUB_API_VERSION: "2026-03-10"
         run: |
           [ -n "$ISSUE_NUMBER" ] || exit 0
-          gh issue edit "$ISSUE_NUMBER" --title "Acceptance (processed)" || true
-          gh issue close "$ISSUE_NUMBER" --reason "completed" || true
-          gh issue lock "$ISSUE_NUMBER" --reason "resolved" || true
+          ISSUE="repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}"
+          # REDACT and LOCK, but do NOT close.
+          #
+          # The student authored this issue, so GitHub subscribes them to it -
+          # and closing is a state change, which emails them. A student
+          # reported receiving "Re: [org/broker-x] Acceptance (processed) -
+          # Closed #1 has been completed", which is mail about internal
+          # plumbing they never asked for and which reads like a failure.
+          #
+          # Editing the title does NOT notify - the same student got exactly
+          # one email, about the close, while this line had already rewritten
+          # their title. So redaction still happens the moment it can, which is
+          # what actually protects the signed invitation (ARCHITECTURE §4.3.2).
+          #
+          # Locking is silent too, and still worth doing: it keeps the issue
+          # from being used as a conversation. Closed vs open changes nothing
+          # else - the hub reads the issue by number, and the page's
+          # "acceptance in flight" check reads `state=all`.
+          #
+          # "(processed)" only when the hub actually has it. A dispatch that
+          # failed every try (or a token that could not be minted) is titled
+          # "(not delivered)", which the student's page reads as "nothing is
+          # coming, try again" instead of waiting minutes for an answer
+          # (frontend/src/lib/acceptance-progress.js). Both spellings are in
+          # lib/broker-issue-titles.mjs, which the tests derive from this file.
+          LABEL="Acceptance"
+          if [ "$KIND" = "confirm" ]; then LABEL="Email confirmation"; fi
+          if [ "$DELIVERED" = "success" ]; then
+            gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method PATCH "$ISSUE" -f title="$LABEL (processed)" >/dev/null || true
+          else
+            gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method PATCH "$ISSUE" -f title="$LABEL (not delivered)" >/dev/null || true
+          fi
+          gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method PUT "$ISSUE/lock" -f lock_reason=resolved >/dev/null || true
